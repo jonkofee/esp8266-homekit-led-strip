@@ -4,9 +4,11 @@ EXTRA_COMPONENTS = \
 	extras/http-parser \
 	extras/i2s_dma \
 	extras/ws2812_i2s \
+	extras/dhcpserver \
 	$(abspath ./components/wolfssl) \
 	$(abspath ./components/cJSON) \
 	$(abspath ./components/homekit) \
+	$(abspath ./components/wifi_config) \
 	$(abspath ./components/WS2812FX)
 
 FLASH_SIZE ?= 32

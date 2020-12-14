@@ -1,16 +1,3 @@
-/*
-* This is an example of an rgb ws2812_i2s led strip animation using a WS2812FX library fork for freertos
-*
-* NOTE:
-*    1) the ws2812_i2s library uses hardware I2S so output pin is GPIO3 and cannot be changed.
-*    2) on some ESP8266 such as the Wemos D1 mini, GPIO3 is the same pin used for serial comms (RX pin).
-*    3) you can still print stuff to serial but transmiting data to wemos will interfere on the leds output
-*
-* Debugging printf statements are disabled below because of note (2) - you can uncomment
-* them if your hardware supports serial comms that do not conflict with I2S on GPIO3.
-*
-* Contributed April 2018 by https://github.com/PCSaito
-*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <espressif/esp_wifi.h>
@@ -23,25 +10,44 @@
 
 #include <homekit/homekit.h>
 #include <homekit/characteristics.h>
-#include "wifi.h"
-
-#include "WS2812FX/WS2812FX.h"
+#include <WS2812FX/WS2812FX.h>
+#include <wifi_config.h>
 
 #define LED_RGB_SCALE 255       // this is the scaling factor used for color conversion
 #define LED_COUNT 300            // this is the number of WS2812B leds on the strip
-#define LED_INBUILT_GPIO 2      // this is the onboard LED used to show on/off only
 
 // Global variables
 float led_hue = 0;              // hue is scaled 0 to 360
 float led_saturation = 100;      // saturation is scaled 0 to 100
 float led_brightness = 33;     // brightness is scaled 0 to 100
 bool led_on = false;            // on is boolean on or off
-bool led_on_value = (bool)0;                // this is the value to write to GPIO for led on (0 = GPIO low)
-
-float fx_hue = 64;              // hue is scaled 0 to 360
-float fx_saturation = 50;      // saturation is scaled 0 to 100
-float fx_brightness = 50;     // brightness is scaled 0 to 100
-bool fx_on = true;
+bool animation_on = false;            // on is boolean on or off
+uint8_t current_mode_index = 0;
+ws2812_pixel_t rgb = { { 0, 0, 0, 0 } };
+int modes[] = {
+    FX_MODE_COLOR_WIPE_RANDOM,
+    FX_MODE_RANDOM_COLOR,
+    FX_MODE_MULTI_DYNAMIC,
+    FX_MODE_RAINBOW,
+    FX_MODE_RAINBOW_CYCLE,
+    FX_MODE_COMET,
+    FX_MODE_SCAN,
+    FX_MODE_DUAL_SCAN,
+    FX_MODE_THEATER_CHASE,
+    FX_MODE_SPARKLE,
+    FX_MODE_MULTI_STROBE,
+    FX_MODE_COLOR_SWEEP_RANDOM,
+    FX_MODE_RUNNING_COLOR,
+    FX_MODE_LARSON_SCANNER,
+    FX_MODE_FIREWORKS,
+    FX_MODE_FIREWORKS_RANDOM,
+    FX_MODE_MERRY_CHRISTMAS,
+    FX_MODE_DUAL_COLOR_WIPE_IN_OUT,
+    FX_MODE_DUAL_COLOR_WIPE_IN_IN,
+    FX_MODE_DUAL_COLOR_WIPE_OUT_OUT,
+    FX_MODE_DUAL_COLOR_WIPE_OUT_IN,
+    FX_MODE_HALLOWEEN
+};
 
 //http://blog.saikoled.com/post/44677718712/how-to-convert-from-hsi-to-rgb-white
 static void hsi2rgb(float h, float s, float i, ws2812_pixel_t* rgb) {
@@ -80,59 +86,37 @@ static void hsi2rgb(float h, float s, float i, ws2812_pixel_t* rgb) {
     rgb->white = (uint8_t) 0;           // white channel is not used
 }
 
-static void wifi_init() {
-    struct sdk_station_config wifi_config = {
-        .ssid = WIFI_SSID,
-        .password = WIFI_PASSWORD,
-    };
-
-    sdk_wifi_set_opmode(STATION_MODE);
-    sdk_wifi_station_set_config(&wifi_config);
-    sdk_wifi_station_connect();
-}
-
-
-void led_identify_task(void *_args) {
-    // initialise the onboard led as a secondary indicator (handy for testing)
-    gpio_enable(LED_INBUILT_GPIO, GPIO_OUTPUT);
-
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-            gpio_write(LED_INBUILT_GPIO, (int)led_on_value);
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-            gpio_write(LED_INBUILT_GPIO, 1 - (int)led_on_value);
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-        }
-        vTaskDelay(250 / portTICK_PERIOD_MS);
-    }
-
-    gpio_write(LED_INBUILT_GPIO, 1 - (int)led_on_value);
-
-    vTaskDelete(NULL);
-}
-
-void led_identify(homekit_value_t _value) {
-    // printf("LED identify\n");
-    xTaskCreate(led_identify_task, "LED identify", 128, NULL, 2, NULL);
-}
-
 homekit_value_t led_on_get() {
     return HOMEKIT_BOOL(led_on);
 }
 
 void led_on_set(homekit_value_t value) {
-    if (value.format != homekit_format_bool) {
-        // printf("Invalid on-value format: %d\n", value.format);
-        return;
-    }
-
     led_on = value.bool_value;
 
     if (led_on) {
-        WS2812FX_setBrightness((uint8_t)floor(led_brightness*2.55));
-
+        update_brightness();
     } else {
         WS2812FX_setBrightness(0);
+    }
+}
+
+homekit_value_t animation_on_get() {
+    return HOMEKIT_BOOL(animation_on);
+}
+
+void animation_on_set(homekit_value_t value) {
+    animation_on = value.bool_value;
+
+    if (animation_on) {
+        current_mode_index++;
+
+        if(current_mode_index >= sizeof(modes)) {
+            current_mode_index = 0;
+        }
+
+        WS2812FX_setMode(modes[current_mode_index]);
+    } else {
+        WS2812FX_setMode(FX_MODE_STATIC);
     }
 }
 
@@ -141,13 +125,9 @@ homekit_value_t led_brightness_get() {
 }
 
 void led_brightness_set(homekit_value_t value) {
-    if (value.format != homekit_format_int) {
-        // printf("Invalid brightness-value format: %d\n", value.format);
-        return;
-    }
     led_brightness = value.int_value;
 
-    WS2812FX_setBrightness((uint8_t)floor(led_brightness*2.55));
+    update_brightness();
 }
 
 homekit_value_t led_hue_get() {
@@ -155,16 +135,9 @@ homekit_value_t led_hue_get() {
 }
 
 void led_hue_set(homekit_value_t value) {
-    if (value.format != homekit_format_float) {
-        // printf("Invalid hue-value format: %d\n", value.format);
-        return;
-    }
     led_hue = value.float_value;
 
-    ws2812_pixel_t rgb = { { 0, 0, 0, 0 } };
-    hsi2rgb(led_hue, led_saturation, 100, &rgb);
-
-    WS2812FX_setColor(rgb.red, rgb.green, rgb.blue);
+    update_color();
 }
 
 homekit_value_t led_saturation_get() {
@@ -172,99 +145,33 @@ homekit_value_t led_saturation_get() {
 }
 
 void led_saturation_set(homekit_value_t value) {
-    if (value.format != homekit_format_float) {
-        // printf("Invalid sat-value format: %d\n", value.format);
-        return;
-    }
     led_saturation = value.float_value;
 
-    ws2812_pixel_t rgb = { { 0, 0, 0, 0 } };
+    update_color();
+}
+
+void update_brightness() {
+    WS2812FX_setBrightness((uint8_t) floor(led_brightness * 2.55));
+}
+
+void update_color() {
     hsi2rgb(led_hue, led_saturation, 100, &rgb);
 
     WS2812FX_setColor(rgb.red, rgb.green, rgb.blue);
 }
 
-homekit_value_t fx_on_get() {
-    return HOMEKIT_BOOL(fx_on);
-}
-
-void fx_on_set(homekit_value_t value) {
-    if (value.format != homekit_format_bool) {
-        // printf("Invalid on-value format: %d\n", value.format);
-        return;
-    }
-    fx_on = value.bool_value;
-
-    if (fx_on) {
-        WS2812FX_mode_theater_chase();
-    } else {
-        WS2812FX_setMode360(0);
-    }
-}
-
-homekit_value_t fx_brightness_get() {
-    return HOMEKIT_INT(fx_brightness);
-}
-
-void fx_brightness_set(homekit_value_t value) {
-    if (value.format != homekit_format_int) {
-        // printf("Invalid brightness-value format: %d\n", value.format);
-        return;
-    }
-    fx_brightness = value.int_value;
-
-    if (fx_brightness > 50) {
-        uint8_t fx_speed = fx_brightness - 50;
-        WS2812FX_setSpeed(fx_speed*5.1);
-        WS2812FX_setInverted(true);
-    } else {
-        uint8_t fx_speed = abs(fx_brightness - 51);
-        WS2812FX_setSpeed(fx_speed*5.1);
-        WS2812FX_setInverted(false);
-    }
-}
-
-homekit_value_t fx_hue_get() {
-    return HOMEKIT_FLOAT(fx_hue);
-}
-
-void fx_hue_set(homekit_value_t value) {
-    if (value.format != homekit_format_float) {
-        // printf("Invalid hue-value format: %d\n", value.format);
-        return;
-    }
-    fx_hue = value.float_value;
-
-    WS2812FX_setMode360(fx_hue);
-}
-
-homekit_value_t fx_saturation_get() {
-    return HOMEKIT_FLOAT(fx_saturation);
-}
-
-void fx_saturation_set(homekit_value_t value) {
-    if (value.format != homekit_format_float) {
-        // printf("Invalid hue-value format: %d\n", value.format);
-        return;
-    }
-    fx_saturation = value.float_value;
-}
-
-homekit_characteristic_t name = HOMEKIT_CHARACTERISTIC_(NAME, "Chihiro");
-
 homekit_accessory_t *accessories[] = {
     HOMEKIT_ACCESSORY(.id = 1, .category = homekit_accessory_category_lightbulb, .services = (homekit_service_t*[]) {
         HOMEKIT_SERVICE(ACCESSORY_INFORMATION, .characteristics = (homekit_characteristic_t*[]) {
-            &name,
-            HOMEKIT_CHARACTERISTIC(MANUFACTURER, "Generic"),
+            HOMEKIT_CHARACTERISTIC(NAME, "jonkofee LED strip"),
+            HOMEKIT_CHARACTERISTIC(MANUFACTURER, "jonkofee"),
             HOMEKIT_CHARACTERISTIC(SERIAL_NUMBER, "137A2BABF19D"),
-            HOMEKIT_CHARACTERISTIC(MODEL, "LEDStripFX"),
+            HOMEKIT_CHARACTERISTIC(MODEL, "WS2812"),
             HOMEKIT_CHARACTERISTIC(FIRMWARE_REVISION, "0.1"),
-            HOMEKIT_CHARACTERISTIC(IDENTIFY, led_identify),
             NULL
         }),
         HOMEKIT_SERVICE(LIGHTBULB, .primary = true, .characteristics = (homekit_characteristic_t*[]) {
-            HOMEKIT_CHARACTERISTIC(NAME, "Chihiro"),
+            HOMEKIT_CHARACTERISTIC(NAME, "LED strip"),
             HOMEKIT_CHARACTERISTIC(
                 ON, true,
             .getter = led_on_get,
@@ -288,26 +195,11 @@ homekit_accessory_t *accessories[] = {
             NULL
         }),
         HOMEKIT_SERVICE(LIGHTBULB, .primary = true, .characteristics = (homekit_characteristic_t*[]) {
-            HOMEKIT_CHARACTERISTIC(NAME, "Chihiro FX"),
+            HOMEKIT_CHARACTERISTIC(NAME, "Animation"),
             HOMEKIT_CHARACTERISTIC(
                 ON, true,
-            .getter = fx_on_get,
-            .setter = fx_on_set
-                ),
-            HOMEKIT_CHARACTERISTIC(
-                BRIGHTNESS, 100,
-            .getter = fx_brightness_get,
-            .setter = fx_brightness_set
-                ),
-            HOMEKIT_CHARACTERISTIC(
-                HUE, 0,
-            .getter = fx_hue_get,
-            .setter = fx_hue_set
-                ),
-            HOMEKIT_CHARACTERISTIC(
-                SATURATION, 0,
-            .getter = fx_saturation_get,
-            .setter = fx_saturation_set
+            .getter = animation_on_get,
+            .setter = animation_on_set
                 ),
             NULL
         }),
@@ -321,22 +213,17 @@ homekit_server_config_t config = {
     .password = "111-11-111"
 };
 
+void on_wifi_ready() {
+    homekit_server_init(&config);
+}
+
+static void wifi_init() {
+    wifi_config_init("jonkofee", NULL, on_wifi_ready);
+}
+
 void user_init(void) {
-    // uart_set_baud(0, 115200);
-
-    // This example shows how to use same firmware for multiple similar accessories
-    // without name conflicts. It uses the last 3 bytes of accessory's MAC address as
-    // accessory name suffix.
-    uint8_t macaddr[6];
-    sdk_wifi_get_macaddr(STATION_IF, macaddr);
-    int name_len = snprintf(NULL, 0, "Chihiro-%02X%02X%02X", macaddr[3], macaddr[4], macaddr[5]);
-    char *name_value = malloc(name_len + 1);
-    snprintf(name_value, name_len + 1, "Chihiro-%02X%02X%02X", macaddr[3], macaddr[4], macaddr[5]);
-    name.value = HOMEKIT_STRING(name_value);
-
     wifi_init();
     WS2812FX_init(LED_COUNT);
-    homekit_server_init(&config);
 
-    led_identify(HOMEKIT_INT(led_brightness));
+    homekit_server_init(&config);
 }
